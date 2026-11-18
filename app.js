@@ -43,6 +43,9 @@
   let callSequenceBusy = false;
   let activeCallIsHusband = false;
   let husbandMaxTimer = null;
+  /** Accept 탭에서 동기 play() 한 첫 클립 — endActiveCall 이 끊지 않도록 */
+  let gesturePrimedSrc = null;
+  let gesturePlayToken = 0;
 
   /* 통화스크립트.txt 순서 — 파일은 업로드본을 증폭해 assets/call 에 배치 */
   const HUSBAND_CALL_SEQUENCE = [
@@ -109,6 +112,25 @@
     el.style.animation = "";
   }
 
+  function getSharedCallAudio() {
+    if (callAudio && callAudio.tagName === "AUDIO") return callAudio;
+    let el = document.getElementById("sharedCallAudio");
+    if (!el) {
+      el = document.createElement("audio");
+      el.id = "sharedCallAudio";
+      el.preload = "auto";
+      el.playsInline = true;
+      el.setAttribute("playsinline", "true");
+      el.setAttribute("webkit-playsinline", "true");
+      el.setAttribute("x-webkit-airplay", "deny");
+      el.controls = false;
+      el.style.cssText = "position:fixed;width:0;height:0;opacity:0;pointer-events:none;";
+      document.body.appendChild(el);
+    }
+    callAudio = el;
+    return el;
+  }
+
   function ensureCallAudioCtx() {
     if (!callAudioCtx) {
       const Ctx = window.AudioContext || window.webkitAudioContext;
@@ -120,20 +142,65 @@
     return callAudioCtx;
   }
 
+  /** 클릭 핸들러 안에서 동기 호출 — iOS Safari 오디오 잠금 해제 */
   function unlockCallAudio() {
-    const ctx = ensureCallAudioCtx();
-    if (!ctx) return Promise.resolve();
-    const resume = ctx.state === "suspended" ? ctx.resume() : Promise.resolve();
-    return resume
-      .then(() => {
-        // iOS Safari: 사용자 제스처 안에서 무음 버퍼를 한 번 재생해 오디오 잠금 해제
-        const buf = ctx.createBuffer(1, 1, ctx.sampleRate || 44100);
-        const src = ctx.createBufferSource();
-        src.buffer = buf;
-        src.connect(ctx.destination);
-        src.start(0);
-      })
-      .catch(() => {});
+    const a = getSharedCallAudio();
+    ensureCallAudioCtx();
+    try {
+      a.muted = true;
+      a.volume = 0;
+      if (!a.src || !String(a.src).includes("silence.wav")) {
+        a.src = "assets/call/silence.wav";
+      }
+      const p = a.play();
+      if (p && typeof p.then === "function") {
+        p.then(() => {
+          try {
+            a.pause();
+            a.currentTime = 0;
+          } catch (_) {}
+          a.muted = false;
+          a.volume = 1;
+        }).catch(() => {
+          a.muted = false;
+          a.volume = 1;
+        });
+      } else {
+        a.muted = false;
+        a.volume = 1;
+      }
+    } catch (_) {
+      a.muted = false;
+      a.volume = 1;
+    }
+  }
+
+  /**
+   * Accept 등 사용자 제스처 스택에서 첫 클립을 즉시 play().
+   * startActiveCall → endActiveCall 이 이 재생을 끊지 않도록 gesturePrimedSrc 설정.
+   */
+  function primeCallAudioFromGesture(src) {
+    if (!src) return;
+    const a = getSharedCallAudio();
+    gesturePlayToken += 1;
+    gesturePrimedSrc = src;
+    a.onended = null;
+    a.onerror = null;
+    a.muted = false;
+    a.volume = 1;
+    try {
+      a.pause();
+    } catch (_) {}
+    a.src = src;
+    try {
+      a.load();
+    } catch (_) {}
+    const playAttempt = a.play();
+    if (playAttempt && typeof playAttempt.catch === "function") {
+      playAttempt.catch(() => {
+        /* playCallSequence 가 다시 시도 */
+      });
+    }
   }
 
   function stopCallBufferSource() {
@@ -174,6 +241,18 @@
     callGainNode = null;
   }
 
+  function audioSrcMatches(el, src) {
+    if (!el || !src) return false;
+    const cur = el.currentSrc || el.src || "";
+    if (!cur) return false;
+    if (cur === src) return true;
+    try {
+      return cur === new URL(src, location.href).href || cur.endsWith(src.replace(/^\.\//, ""));
+    } catch (_) {
+      return String(cur).includes(src.split("/").pop());
+    }
+  }
+
   function stopCallBed() {
     if (!callBedAudio) return;
     callBedAudio.onended = null;
@@ -194,7 +273,8 @@
     }
   }
 
-  function stopCallPlayback() {
+  function stopCallPlayback(options = {}) {
+    const preserveGesture = !!options.preserveGesture && !!gesturePrimedSrc;
     callSequenceBusy = false;
     activeCallOnComplete = null;
     clearHusbandMaxTimer();
@@ -206,13 +286,15 @@
       clearTimeout(callConnectTimer);
       callConnectTimer = null;
     }
-    if (callAudio) {
+    if (callAudio && !preserveGesture) {
       callAudio.onended = null;
       callAudio.onerror = null;
-      callAudio.pause();
-      callAudio.src = "";
-      callAudio = null;
+      try {
+        callAudio.pause();
+      } catch (_) {}
+      // iOS: src 비우면 다음 play 권한도 날아갈 수 있어 유지. pause만.
     }
+    if (!preserveGesture) gesturePrimedSrc = null;
     stopCallBed();
     disconnectCallAudioGraph();
     hideCallSubtitle();
@@ -228,11 +310,11 @@
     if (timerEl) timerEl.textContent = "00:00";
   }
 
-  function endActiveCall() {
+  function endActiveCall(options = {}) {
     activeCallOnComplete = null;
     activeCallIsHusband = false;
     callEnding = false;
-    stopCallPlayback();
+    stopCallPlayback(options);
     stopActiveCallTimer();
     const active = document.getElementById("activeCall");
     if (active) {
@@ -321,52 +403,81 @@
     }
 
     hideCallSubtitle();
-    if (callAudio) {
-      callAudio.onended = null;
-      callAudio.onerror = null;
-      callAudio.pause();
-    }
     disconnectCallAudioGraph();
 
-    // iOS Safari: HTMLAudio.play() 가 제스처 밖/연속 재생에서 자주 막힘
-    // → AudioContext + decodeAudioData 버퍼 재생 (응답 탭에서 unlockCallAudio 필수)
-    const playViaHtmlAudio = () => {
-      callAudio = new Audio(step.src);
-      callAudio.preload = "auto";
-      callAudio.playsInline = true;
-      callAudio.setAttribute("playsinline", "true");
-      callAudio.setAttribute("webkit-playsinline", "true");
-      callAudio.volume = 1;
-      callAudio.onended = next;
-      callAudio.onerror = () => next();
-      callAudio.play().catch(() => next());
+    const a = getSharedCallAudio();
+    const bindEnded = () => {
+      a.onended = () => next();
+      a.onerror = () => next();
     };
 
-    const ctx = ensureCallAudioCtx();
-    if (!ctx) {
-      playViaHtmlAudio();
-      return;
+    // Accept 제스처에서 이미 재생 중이면 핸들러만 연결 (절대 pause/재load 금지)
+    if (gesturePrimedSrc === step.src) {
+      const primedOk = audioSrcMatches(a, step.src) && !a.paused;
+      gesturePrimedSrc = null;
+      if (primedOk) {
+        bindEnded();
+        return;
+      }
     }
 
-    loadCallBuffer(step.src)
-      .then((buffer) => {
-        if (!callSequenceBusy) return;
-        stopCallBufferSource();
-        const srcNode = ctx.createBufferSource();
-        callBufferSource = srcNode;
-        srcNode.buffer = buffer;
-        srcNode.connect(ctx.destination);
-        srcNode.onended = () => {
-          if (callBufferSource === srcNode) callBufferSource = null;
-          next();
-        };
-        if (ctx.state === "suspended") {
-          ctx.resume().then(() => srcNode.start(0)).catch(() => playViaHtmlAudio());
-        } else {
-          srcNode.start(0);
-        }
-      })
-      .catch(() => playViaHtmlAudio());
+    // 같은 요소로 src만 바꿔 연속 재생 (iOS는 요소 재사용이 중요)
+    const playViaHtmlAudio = () => {
+      const el = getSharedCallAudio();
+      el.onended = null;
+      el.onerror = null;
+      el.muted = false;
+      el.volume = 1;
+      if (!audioSrcMatches(el, step.src) || el.ended || el.paused) {
+        try {
+          el.pause();
+        } catch (_) {}
+        el.src = step.src;
+        try {
+          el.load();
+        } catch (_) {}
+      }
+      bindEnded();
+      const p = el.play();
+      if (p && typeof p.catch === "function") {
+        p.catch(() => {
+          // HTMLAudio 실패 시 Web Audio 버퍼로 한 번 더
+          const ctx = ensureCallAudioCtx();
+          if (!ctx) {
+            next();
+            return;
+          }
+          loadCallBuffer(step.src)
+            .then((buffer) => {
+              if (!callSequenceBusy) return;
+              stopCallBufferSource();
+              const srcNode = ctx.createBufferSource();
+              callBufferSource = srcNode;
+              srcNode.buffer = buffer;
+              srcNode.connect(ctx.destination);
+              srcNode.onended = () => {
+                if (callBufferSource === srcNode) callBufferSource = null;
+                next();
+              };
+              const start = () => {
+                try {
+                  srcNode.start(0);
+                } catch (_) {
+                  next();
+                }
+              };
+              if (ctx.state === "suspended") {
+                ctx.resume().then(start).catch(() => next());
+              } else {
+                start();
+              }
+            })
+            .catch(() => next());
+        });
+      }
+    };
+
+    playViaHtmlAudio();
   }
 
   function setActiveCallVisuals({ name, poster, initial }) {
@@ -426,7 +537,8 @@
     } = options;
 
     hideIncomingCall();
-    endActiveCall();
+    // 제스처에서 이미 play() 한 클립이 있으면 끊지 않음
+    endActiveCall({ preserveGesture: !!gesturePrimedSrc });
     ensureCallAudioCtx();
 
     activeCallIsHusband = !!isHusband;
@@ -474,15 +586,32 @@
   function preloadHusbandCallAudio() {
     HUSBAND_CALL_SEQUENCE.forEach((step) => {
       if (step.type !== "audio" || !step.src) return;
+      // HTMLAudio preload + 버퍼 캐시 (실패해도 무시)
+      try {
+        const link = document.createElement("link");
+        link.rel = "preload";
+        link.as = "audio";
+        link.href = step.src;
+        document.head.appendChild(link);
+      } catch (_) {}
       loadCallBuffer(step.src).catch(() => {});
     });
+  }
+
+  function firstAudioSrc(sequence) {
+    const step = sequence.find((s) => s.type === "audio" && s.src);
+    return step ? step.src : null;
   }
 
   function startHusbandCall(options = {}) {
     if (husbandCallCompleted) return;
     // 모바일 Safari: 연결 지연 없이 제스처 직후 재생해야 소리가 남
     const connectingMs = options.connectingMs ?? 0;
-    unlockCallAudio();
+    if (!gesturePrimedSrc) {
+      const first = firstAudioSrc(HUSBAND_CALL_SEQUENCE);
+      if (first) primeCallAudioFromGesture(first);
+      else unlockCallAudio();
+    }
     ensureCallAudioCtx();
     preloadHusbandCallAudio();
     startActiveCall({
@@ -501,12 +630,17 @@
   }
 
   function startYushiCall() {
+    if (!gesturePrimedSrc) {
+      const first = firstAudioSrc(YUSHI_CALL_SEQUENCE);
+      if (first) primeCallAudioFromGesture(first);
+      else unlockCallAudio();
+    }
     startActiveCall({
       name: "유우시",
       poster: null,
       initial: "유",
       sequence: YUSHI_CALL_SEQUENCE,
-      connectingMs: 2000,
+      connectingMs: 0,
       connectingLabel: "연결 중...",
       onComplete: () => showCallEndedThenHangup(),
     });
@@ -1228,23 +1362,32 @@
 
   document.getElementById("callDeclineBtn")?.addEventListener("click", hideIncomingCall);
   document.getElementById("callAcceptBtn")?.addEventListener("click", () => {
-    unlockCallAudio();
+    // iOS Safari: play()는 이 클릭 스택 안에서 동기적으로 시작해야 함
+    const first = firstAudioSrc(HUSBAND_CALL_SEQUENCE);
+    if (first) primeCallAudioFromGesture(first);
+    else unlockCallAudio();
     startHusbandCall({ connectingMs: 0 });
   });
   document.getElementById("callRemindBtn")?.addEventListener("click", hideIncomingCall);
   document.getElementById("callMessageBtn")?.addEventListener("click", hideIncomingCall);
-  document.getElementById("activeCallEndBtn")?.addEventListener("click", endActiveCall);
+  document.getElementById("activeCallEndBtn")?.addEventListener("click", () => endActiveCall());
   document.getElementById("missedCallYushi")?.addEventListener("click", () => {
-    unlockCallAudio();
+    const first = firstAudioSrc(YUSHI_CALL_SEQUENCE);
+    if (first) primeCallAudioFromGesture(first);
+    else unlockCallAudio();
     startYushiCall();
   });
   document.getElementById("callHusbandRecent")?.addEventListener("click", () => {
-    unlockCallAudio();
+    const first = firstAudioSrc(HUSBAND_CALL_SEQUENCE);
+    if (first) primeCallAudioFromGesture(first);
+    else unlockCallAudio();
     startHusbandCall({ connectingMs: 0 });
   });
   document.querySelectorAll("[data-call-husband]").forEach((el) => {
     el.addEventListener("click", () => {
-      unlockCallAudio();
+      const first = firstAudioSrc(HUSBAND_CALL_SEQUENCE);
+      if (first) primeCallAudioFromGesture(first);
+      else unlockCallAudio();
       startHusbandCall({ connectingMs: 0 });
     });
   });
