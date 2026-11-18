@@ -1397,7 +1397,7 @@ body {
 .msg-row-chat {
   display: flex;
   gap: 8px;
-  max-width: 86%;
+  max-width: 92%;
   width: fit-content;
   align-self: flex-start;
   box-sizing: border-box;
@@ -1453,14 +1453,15 @@ body {
 }
 
 .bubble {
-  max-width: min(230px, 72%);
-  padding: 10px 12px;
-  border-radius: 14px;
+  /* 실제 카톡처럼 가로로 충분히 늘어난 뒤 줄바꿈 */
+  max-width: min(300px, 78%);
+  padding: 9px 13px;
+  border-radius: 16px;
   font-size: 15px;
-  line-height: 1.4;
+  line-height: 1.45;
   letter-spacing: -0.02em;
-  word-break: break-word;
-  overflow-wrap: anywhere;
+  word-break: keep-all;
+  overflow-wrap: break-word;
   white-space: pre-wrap;
   box-sizing: border-box;
   overflow: hidden;
